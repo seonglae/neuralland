@@ -1,6 +1,7 @@
 import os
 import json
 import torch
+import concurrent.futures
 import zstandard as zstd
 import io
 import pickle  # For caching
@@ -19,7 +20,7 @@ d_model = 4096  # Model's hidden size
 api_key = os.environ["MISTRAL_API_KEY"]
 model_name = "mistral-large-latest"
 output_file = 'feature_descriptions.json'
-cache_dir = 'cache_dir'  # Directory to store cached activations and tokens
+cache_dir = 'act-cache'  # Directory to store cached activations and tokens
 
 # Ensure the cache directory exists
 os.makedirs(cache_dir, exist_ok=True)
@@ -74,21 +75,27 @@ class CompressedJSONLLoader:
 
 # Function to create the interpretability prompt and send the request
 def get_feature_description(feature_idx, contexts):
-    # contexts is a list of lists of tokens
+    # contexts is a list of tuples: (tokens, activations)
     activations_str = ''
-    for context in contexts:
-        tokens_str = '\n'.join([f"{token}\tunknown" for token in context])
+    prompt_str = ''
+    for tokens, activations in contexts:
+        prompt_str += ''.join([f"{token}" for token in tokens])
+        tokens_str = '\n'.join([f"{token}\t{activation_value:.4f}" for token, activation_value in zip(tokens, activations)])
         activations_str += f"<start>\n{tokens_str}\n<end>\n"
+
+    # Adjusted prompt to request a short JSON object
     prompt = f"""We're studying neurons in a neural network.
 Each neuron looks for some particular thing in a short document.
-Look at the summary of what the neuron does, and try to predict how it will fire on each token.
+Look at summary of what the neuron does, and try to predict how it will fire on each token.
+Please provide a brief description of what neuron {feature_idx} is detecting.
+The activation format is token<tab>activation, activations go from -1 to 1, "unknown" indicates an unknown activation.
+Return your answer as a short JSON object with keys "description" and "id".
 
-The activation format is token<tab>activation, activations go from 0 to 10, "unknown" indicates an unknown activation. Most activations will be 0.
-
-Neuron {feature_idx}
-Explanation of neuron {feature_idx} behavior: The main thing this neuron does is [provide a description].
 Activations:
 {activations_str}
+
+Prompts:
+{prompt_str}
 """
 
     # Send prompt to Mistral API and get the description
@@ -98,17 +105,28 @@ Activations:
             "content": prompt,
         },
     ]
+    print(f"Prompt: {prompt}")
     try:
         chat_response = client.chat.complete(
             model=model_name,
             messages=messages,
+            response_format={
+                "type": "json_object",
+            }
         )
-        response_content = chat_response.choices[0].message.content
-        description = response_content.strip()
+        description = chat_response.choices[0].message.content.strip()
+        print(f"Description: {description}")
     except Exception as e:
         print(f"Error for feature {feature_idx}: {e}")
         description = f"Error: {e}"
-    return description
+    return {'feature_idx': feature_idx, 'description': description, 'prompt': prompt}
+
+
+# Function wrapper for asynchronous execution
+def get_feature_description_wrapper(args):
+    feature_idx, contexts = args
+    return get_feature_description(feature_idx, contexts)
+
 
 # Main processing loop
 data_loader = CompressedJSONLLoader(data_path, batch_size=batch_size)
@@ -119,7 +137,7 @@ max_contexts_per_feature = 50  # Limit the number of contexts per feature
 window_size = 10  # Number of tokens before and after the high activation token
 
 for batch_idx, batch in enumerate(tqdm(data_loader, desc="Processing batches", unit="batch")):
-    cache_file = os.path.join(cache_dir, f'{data_path}_{batch_idx}.pkl')
+    cache_file = os.path.join(cache_dir, f'{os.path.basename(data_path)}_{batch_idx}.pkl')
 
     if os.path.exists(cache_file):
         # Load tokens_list and activations_list from the cache
@@ -178,24 +196,36 @@ for batch_idx, batch in enumerate(tqdm(data_loader, desc="Processing batches", u
                 start = max(idx - window_size, 0)
                 end = min(idx + window_size + 1, len(tokens))  # +1 because end index is exclusive
                 context_tokens = tokens[start:end]
+                context_activations = feature_activations[start:end]
 
                 # Store context for the feature
                 if len(feature_contexts[feature_idx]) < max_contexts_per_feature:
-                    feature_contexts[feature_idx].append(context_tokens)
+                    feature_contexts[feature_idx].append((context_tokens, context_activations))
 
     # Optional: Limit the number of batches to process for testing
     # if batch_idx + 1 >= 5:
     #     break
+    break  # Remove this 'break' if you want to process all batches
 
 print("Finished processing data.")
+
+# Prepare arguments for asynchronous execution
+feature_args = list(feature_contexts.items())[:100]
 
 # Get descriptions for each feature
 results = []
 print("Starting to get feature descriptions...")
-for feature_idx, contexts in tqdm(feature_contexts.items(), desc="Processing features", unit="feature"):
-    description = get_feature_description(feature_idx, contexts)
-    results.append({'feature_idx': feature_idx, 'description': description})
-
+max_workers = 10  # Number of parallel requests
+with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+    futures = {executor.submit(get_feature_description_wrapper, args): args[0] for args in feature_args}
+    for future in tqdm(concurrent.futures.as_completed(futures), total=len(futures), desc="Processing features", unit="feature"):
+        feature_idx = futures[future]
+        try:
+            result = future.result()
+            results.append(result)
+        except Exception as e:
+            print(f"Error processing feature {feature_idx}: {e}")
+        
 print("Finished getting feature descriptions.")
 
 # Save results to JSON
