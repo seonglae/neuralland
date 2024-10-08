@@ -3,6 +3,7 @@ import json
 import torch
 import zstandard as zstd
 import io
+import pickle  # For caching
 from transformers import AutoTokenizer
 from mistral_sae.generate import get_input_activations_at_layer
 from mistral_sae.model import SteerableTransformer
@@ -10,7 +11,7 @@ from mistralai import Mistral
 from tqdm import tqdm  # For progress bars
 
 # Configuration variables
-batch_size = 4096  # Adjust as needed
+batch_size = 1  # Adjust as needed
 data_path = 'pile-uncopyrighted/test/val.jsonl.zst'  # Replace with the actual data path
 mistral_models_path = 'Mistral-7B-Instruct-v0.3'  # Replace with the actual model path
 target_layer = 16  # Layer to get activations from
@@ -18,6 +19,10 @@ d_model = 4096  # Model's hidden size
 api_key = os.environ["MISTRAL_API_KEY"]
 model_name = "mistral-large-latest"
 output_file = 'feature_descriptions.json'
+cache_dir = 'cache_dir'  # Directory to store cached activations and tokens
+
+# Ensure the cache directory exists
+os.makedirs(cache_dir, exist_ok=True)
 
 # Initialize Mistral API client
 client = Mistral(api_key=api_key)
@@ -114,24 +119,44 @@ max_contexts_per_feature = 50  # Limit the number of contexts per feature
 window_size = 10  # Number of tokens before and after the high activation token
 
 for batch_idx, batch in enumerate(tqdm(data_loader, desc="Processing batches", unit="batch")):
-    for text_idx, text in enumerate(batch):
-        # Tokenize text
-        encoding = tokenizer(text, return_tensors='pt', truncation=True, max_length=512).to('cuda')
-        input_ids = encoding['input_ids']  # Shape: [batch_size, sequence_length]
+    cache_file = os.path.join(cache_dir, f'{data_path}_{batch_idx}.pkl')
 
-        # Get activations from the model
-        with torch.no_grad():
-            activations = get_input_activations_at_layer(
-                input_ids.tolist(),
-                model,
-                target_layer=target_layer
-            ).cpu()  # Shape: [sequence_length, d_model]
+    if os.path.exists(cache_file):
+        # Load tokens_list and activations_list from the cache
+        with open(cache_file, 'rb') as f:
+            tokens_list, activations_list = pickle.load(f)
+        print(f"Loaded batch {batch_idx} from cache.")
+    else:
+        tokens_list = []
+        activations_list = []
+        for text_idx, text in enumerate(batch):
+            # Tokenize text
+            encoding = tokenizer(text, return_tensors='pt', truncation=True, max_length=512).to('cuda')
+            input_ids = encoding['input_ids']  # Shape: [batch_size, sequence_length]
 
-        # Map activations to tokens
-        activations = activations.to(torch.float32).numpy()
-        input_ids = input_ids.cpu().numpy()[0]  # Shape: [sequence_length]
-        tokens = tokenizer.convert_ids_to_tokens(input_ids)
+            # Get activations from the model
+            with torch.no_grad():
+                activations = get_input_activations_at_layer(
+                    input_ids.tolist(),
+                    model,
+                    target_layer=target_layer
+                ).cpu()  # Shape: [sequence_length, d_model]
 
+            # Convert activations and tokens to lists for saving
+            activations = activations.to(torch.float32).numpy()
+            input_ids = input_ids.cpu().numpy()[0]  # Shape: [sequence_length]
+            tokens = tokenizer.convert_ids_to_tokens(input_ids)
+
+            tokens_list.append(tokens)
+            activations_list.append(activations)
+
+        # Save tokens_list and activations_list to the cache
+        with open(cache_file, 'wb') as f:
+            pickle.dump((tokens_list, activations_list), f)
+        print(f"Saved batch {batch_idx} to cache.")
+
+    # Now process the tokens and activations
+    for tokens, activations in zip(tokens_list, activations_list):
         num_features = activations.shape[1]
         for feature_idx in range(num_features):
             # Initialize contexts list for the feature if not already done
