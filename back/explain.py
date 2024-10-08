@@ -3,30 +3,31 @@ import json
 import torch
 import zstandard as zstd
 import io
-
 from transformers import AutoTokenizer
+from mistral_sae.generate import get_input_activations_at_layer
+from mistral_sae.model import SteerableTransformer
 from mistralai import Mistral
-from mistral_sae.sae import SparseAutoencoder
+from tqdm import tqdm  # For progress bars
 
-
-D_MODEL = 4096
-D_HIDDEN = 131072
-
-# Load the SAE model
-sae = SparseAutoencoder(D_MODEL, D_HIDDEN)
-sae_model_path = 'sae.pth'
-sae = sae.load_state_dict(torch.load(sae_model_path))
-sae = sae.eval()
-
-# Initialize Mistral API client
+# Configuration variables
+batch_size = 4096  # Adjust as needed
+data_path = 'pile-uncopyrighted/test/val.jsonl.zst'  # Replace with the actual data path
+mistral_models_path = 'Mistral-7B-Instruct-v0.3'  # Replace with the actual model path
+target_layer = 16  # Layer to get activations from
+d_model = 4096  # Model's hidden size
 api_key = os.environ["MISTRAL_API_KEY"]
 model_name = "mistral-large-latest"
+output_file = 'feature_descriptions.json'
 
-# Load the tokenizer
-tokenizer = AutoTokenizer.from_pretrained('Mistral-7B-Instruct-v0.3')
+# Initialize Mistral API client
 client = Mistral(api_key=api_key)
 
-# Data loader class to read from compressed .jsonl.zst files
+# Load tokenizer and model
+tokenizer = AutoTokenizer.from_pretrained('Mistral-7B-Instruct-v0.3')
+model = SteerableTransformer.from_folder(mistral_models_path).cuda()
+model.eval()
+
+# Class to read data from compressed .jsonl.zst files
 class CompressedJSONLLoader:
     def __init__(self, file_path, batch_size=1):
         self.file_path = file_path
@@ -66,82 +67,114 @@ class CompressedJSONLLoader:
         if self.file:
             self.file.close()
 
-# Function to create the interpretability prompt
-def create_interpretability_prompt(explanation, tokens):
-    prompt = """We're studying neurons in a neural network.
+# Function to create the interpretability prompt and send the request
+def get_feature_description(feature_idx, contexts):
+    # contexts is a list of lists of tokens
+    activations_str = ''
+    for context in contexts:
+        tokens_str = '\n'.join([f"{token}\tunknown" for token in context])
+        activations_str += f"<start>\n{tokens_str}\n<end>\n"
+    prompt = f"""We're studying neurons in a neural network.
 Each neuron looks for some particular thing in a short document.
-Look at summary of what the neuron does, and try to predict how it will fire on each token.
+Look at the summary of what the neuron does, and try to predict how it will fire on each token.
 
 The activation format is token<tab>activation, activations go from 0 to 10, "unknown" indicates an unknown activation. Most activations will be 0.
 
+Neuron {feature_idx}
+Explanation of neuron {feature_idx} behavior: The main thing this neuron does is [provide a description].
+Activations:
+{activations_str}
+"""
 
-Neuron 1
-Explanation of neuron 1 behavior: the main thing this neuron does is find vowels
-Activations: 
-<start>
-a\t10
-b\t0
-c\t0
-<end>
-<start>
-d\tunknown
-e\t10
-f\t0
-<end>
+    # Send prompt to Mistral API and get the description
+    messages = [
+        {
+            "role": "user",
+            "content": prompt,
+        },
+    ]
+    try:
+        chat_response = client.chat.complete(
+            model=model_name,
+            messages=messages,
+        )
+        response_content = chat_response.choices[0].message.content
+        description = response_content.strip()
+    except Exception as e:
+        print(f"Error for feature {feature_idx}: {e}")
+        description = f"Error: {e}"
+    return description
 
-
-Neuron 2
-Explanation of neuron 2 behavior: the main thing this neuron does is {}
-Activations: 
-<start>
-""".format(explanation)
-
-    # Add tokens with 'unknown' activation
-    for token in tokens:
-        prompt += f"{token}\tunknown\n"
-    prompt += "<end>\n"
-
-    return prompt
-
-# Main loop
-data_path = 'pile-uncopyrighted/test/val.jsonl.zst'  # Replace with your actual data path
-batch_size = 1  # Adjust the batch size as needed
+# Main processing loop
 data_loader = CompressedJSONLLoader(data_path, batch_size=batch_size)
+feature_contexts = {}  # Dictionary to store contexts per feature
 
-for batch in data_loader:
-    for text in batch:
-        # Tokenize the text
-        tokens = tokenizer.tokenize(text)
-        # Convert tokens to IDs
-        token_ids = tokenizer.convert_tokens_to_ids(tokens)
-        input_ids = torch.tensor(token_ids).unsqueeze(0).to('cuda')  # Batch size 1
+print("Starting to process data...")
+max_contexts_per_feature = 50  # Limit the number of contexts per feature
+window_size = 10  # Number of tokens before and after the high activation token
 
-        # Get activations from SAE model
+for batch_idx, batch in enumerate(tqdm(data_loader, desc="Processing batches", unit="batch")):
+    for text_idx, text in enumerate(batch):
+        # Tokenize text
+        encoding = tokenizer(text, return_tensors='pt', truncation=True, max_length=512).to('cuda')
+        input_ids = encoding['input_ids']  # Shape: [batch_size, sequence_length]
+
+        # Get activations from the model
         with torch.no_grad():
-            activations = sae(input_ids)
-            activations = activations.squeeze(0)  # [num_features, sequence_length]
+            activations = get_input_activations_at_layer(
+                input_ids.tolist(),
+                model,
+                target_layer=target_layer
+            ).cpu()  # Shape: [sequence_length, d_model]
 
-        num_features = activations.shape[0]
+        # Map activations to tokens
+        activations = activations.to(torch.float32).numpy()
+        input_ids = input_ids.cpu().numpy()[0]  # Shape: [sequence_length]
+        tokens = tokenizer.convert_ids_to_tokens(input_ids)
+
+        num_features = activations.shape[1]
         for feature_idx in range(num_features):
-            feature_activations = activations[feature_idx, :].cpu().numpy()
-            explanation = f"find feature {feature_idx}"
-            prompt = create_interpretability_prompt(explanation, tokens)
-            messages = [
-                {
-                    "role": "user",
-                    "content": prompt,
-                },
-            ]
+            # Initialize contexts list for the feature if not already done
+            if feature_idx not in feature_contexts:
+                feature_contexts[feature_idx] = []
 
-            # Send the prompt to the Mistral API
-            try:
-                chat_response = client.chat.complete(
-                    model=model_name,
-                    messages=messages,
-                )
-                response_content = chat_response.choices[0].message.content
-                # Process the response content
-                print(f"Feature {feature_idx} response:")
-                print(response_content)
-            except Exception as e:
-                print(f"Error for feature {feature_idx}: {e}")
+            # Skip if we already have enough contexts for this feature
+            if len(feature_contexts[feature_idx]) >= max_contexts_per_feature:
+                continue
+
+            # Get activation values for each feature
+            feature_activations = activations[:, feature_idx]  # Shape: [sequence_length]
+            # Find tokens with high activation values
+            top_k = 5  # Top 5 tokens
+            high_activation_indices = feature_activations.argsort()[::-1][:top_k]
+
+            for idx in high_activation_indices:
+                # Get context around this token
+                start = max(idx - window_size, 0)
+                end = min(idx + window_size + 1, len(tokens))  # +1 because end index is exclusive
+                context_tokens = tokens[start:end]
+
+                # Store context for the feature
+                if len(feature_contexts[feature_idx]) < max_contexts_per_feature:
+                    feature_contexts[feature_idx].append(context_tokens)
+
+    # Optional: Limit the number of batches to process for testing
+    # if batch_idx + 1 >= 5:
+    #     break
+
+print("Finished processing data.")
+
+# Get descriptions for each feature
+results = []
+print("Starting to get feature descriptions...")
+for feature_idx, contexts in tqdm(feature_contexts.items(), desc="Processing features", unit="feature"):
+    description = get_feature_description(feature_idx, contexts)
+    results.append({'feature_idx': feature_idx, 'description': description})
+
+print("Finished getting feature descriptions.")
+
+# Save results to JSON
+with open(output_file, 'w') as f:
+    json.dump(results, f, indent=2, ensure_ascii=False)
+
+print(f"Results saved to '{output_file}'.")
