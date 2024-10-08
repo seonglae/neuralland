@@ -8,3 +8,13 @@ export type Feature = {
   emoji: string
   value: boolean
 }
+
+export type Chat = {
+  id: string
+  title: string
+  history: {
+    query: string
+    prompt_res: string
+    act_res: string
+  }[]
+}
