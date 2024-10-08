@@ -67,19 +67,14 @@ const ChatPage = ({ params, searchParams }: { params: { chatid: string }, search
           <h2 className="text-lg font-bold mb-4 text-white">Chat List</h2>
           <div className="flex-1 overflow-y-auto">
             <ul>
-              {chats.map((chat, index) => (
-                <li key={index} className="text-gray-400 mb-2 cursor-pointer" onClick={() => router.push(`/chat/${chat.id}`)}>
-                  {chat.title}
-                </li>
-              ))}
             </ul>
           </div>
         </div>
 
         {/* Middle Column - Activation Engineering Chat */}
-        <div className="w-5/12 p-4 flex flex-col relative">
+        <div className="w-5/12 p-4 flex flex-col relative border-r border-gray-400">
           <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
-            <span className="text-6xl font-bold text-gray-900 opacity-70 text-center">
+            <span className="text-6xl font-bold text-gray-300 opacity-20 text-center">
               Activation Engineering
             </span>
           </div>
@@ -96,7 +91,7 @@ const ChatPage = ({ params, searchParams }: { params: { chatid: string }, search
         {/* Right Column - Prompt Engineering Chat */}
         <div className="w-5/12 p-4 flex flex-col relative">
           <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
-            <span className="text-6xl font-bold text-gray-900 opacity-70 text-center">
+            <span className="text-6xl font-bold text-gray-300 opacity-20 text-center">
               Prompt Engineering
             </span>
           </div>

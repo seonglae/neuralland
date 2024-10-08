@@ -6,15 +6,16 @@ import zstandard as zstd
 import io
 import pickle  # For caching
 from transformers import AutoTokenizer
-from transformer_lens import HookedTransformer, ActivationCache
+from transformer_lens import HookedTransformer
 from sae_lens import SAE
 from mistralai import Mistral
+import numpy as np
 from tqdm import tqdm  # For progress bars
 
 # Configuration variables
 batch_size = 1  # Adjust as needed
-data_path = 'pile-uncopyrighted/test/val.jsonl.zst'  # Replace with the actual data path
-mistral_models_path = 'Mistral-7B-Instruct-v0.3'  # Replace with the actual model path
+data_path = '../pile-uncopyrighted/test/val.jsonl.zst'  # Replace with the actual data path
+mistral_models_path = '../Mistral-7B-Instruct-v0.3'  # Replace with the actual model path
 target_layer = "blocks.16.hook_resid_pre"  # Layer to get activations from
 d_model = 4096  # Model's hidden size
 api_key = os.environ["MISTRAL_API_KEY"]
@@ -29,7 +30,7 @@ os.makedirs(cache_dir, exist_ok=True)
 client = Mistral(api_key=api_key)
 
 # Load tokenizer and model
-tokenizer = AutoTokenizer.from_pretrained('Mistral-7B-Instruct-v0.3')
+tokenizer = AutoTokenizer.from_pretrained('../Mistral-7B-Instruct-v0.3')
 model = HookedTransformer.from_pretrained("mistral-7b-instruct", dtype="float16", device="cuda")
 sae, cfg_dict, sparsity = SAE.from_pretrained(
     release="tylercosgrove/mistral-7b-sparse-autoencoder-layer16",
@@ -96,8 +97,8 @@ def get_feature_description(feature_idx, contexts, mean_activation):
 Each neuron looks for some particular thing in a short document.
 Look at summary of what the neuron does, and try to predict how it will fire on each token.
 Please provide a brief description of what neuron {feature_idx} is detecting.
-The activation format is token<tab>activation, activations go from 0 to 10, "unknown" indicates an unknown activation. Most activations will be 0.
-Return your answer as a short JSON object with keys "description", "title" (short noun description of neuron), "mean_activation" of neuron {feature_idx}, "useful" (0-1), single "emoji" represents features well, and "confidence" (0-1).
+The activation format is token<tab>activation, activations is integer from 0, "unknown" indicates an unknown activation. Most activations will be 0.
+Return your answer as a short JSON object with keys "description"(without refering neuron and index number), "title" (short noun description of neuron), "mean_activation" of neuron {feature_idx}, "useful" (0-1), single "emoji" represents features well, and "confidence" (0-1).
 
 Activations:
 {activations_str}
@@ -123,31 +124,35 @@ Prompts:
             }
         )
         response = json.loads(chat_response.choices[0].message.content.strip())
-        print(f"Description: {response['description']}")
+        print(f"Title: {response['title']}")
     except Exception as e:
         print(f"Error for feature {feature_idx}: {e}")
         response = {'description': 'Error', 'title': 'Error', 'mean_activation': mean_activation}
-    return {'index': feature_idx, 'emoji': response['emoji'], 'description': response['description'], 'title': response['title'], 'mean_activation': mean_activation, 'useful': response['useful'], 'confidence': response['confidence'], 'contexts': contexts }
+    
+    for i, (tokens, activations) in enumerate(contexts):
+        contexts[i] = ([token.replace('▁', ' ') for token in tokens], activations)
+    return {'index': feature_idx, 'emoji': response['emoji'], 'description': response['description'], 'title': response['title'], 'mean_activation': mean_activation, 'useful': response['useful'], 'confidence': response['confidence'] }
 
 
 # Function wrapper for asynchronous execution
 def get_feature_description_wrapper(args):
-    feature_idx, contexts, mean_activation, useful, confidence = args
+    feature_idx, contexts, mean_activation = args
     return get_feature_description(feature_idx, contexts, mean_activation)
 
 
 # Main processing loop
 data_loader = CompressedJSONLLoader(data_path, batch_size=batch_size)
 feature_contexts = {}  # Dictionary to store contexts per feature
-all_high_activations = []  # List to keep track of top activations across batches
+
+# Get feature indices from the SAE model
+num_features = cfg_dict['d_sae']  # Get the number of features from the SAE configuration
+feature_indices = range(cfg_dict['d_sae'])  # Use range of d_sae as feature indices
+all_high_activations = [[] for _ in range(num_features)]  # List to keep track of top activations across batches
 
 print("Starting to process data...")
 max_contexts_per_feature = 50  # Limit the number of contexts per feature
 window_size = 10  # Number of tokens before and after the high activation token
 
-# Get feature indices from the SAE model
-num_features = cfg_dict['d_sae']  # Get the number of features from the SAE configuration
-feature_indices = range(cfg_dict['d_sae'])  # Use range of d_sae as feature indices
 
 for batch_idx, batch in enumerate(tqdm(data_loader, desc="Processing batches", unit="batch")):
     cache_file = os.path.join(cache_dir, f'{os.path.basename(data_path)}_{batch_idx}.pkl')
@@ -169,11 +174,11 @@ for batch_idx, batch in enumerate(tqdm(data_loader, desc="Processing batches", u
             with torch.no_grad():
                 _, cache = model.run_with_cache(input_ids)
                 activations = cache[target_layer]  # Extract activations at the target layer
-                activations = activations.squeeze(0).cpu()  # Shape: [sequence_length, d_model]
+                activations = activations.squeeze(0)  # Shape: [sequence_length, d_model]
 
             # Convert activations and tokens to lists for saving
             activations = sae.encode_standard(activations)  # Use SAE to encode activations into sparse features
-            activations = activations.to(torch.float32).numpy()
+            activations = activations.to(torch.float32).cpu().detach().numpy()  # Convert to numpy array
             input_ids = input_ids.cpu().numpy()[0]  # Shape: [sequence_length]
             tokens = tokenizer.convert_ids_to_tokens(input_ids)
 
@@ -195,7 +200,11 @@ for batch_idx, batch in enumerate(tqdm(data_loader, desc="Processing batches", u
 
             # Get activation values for each feature
             feature_activations = activations[:, feature_idx]  # Shape: [sequence_length]
-            mean_activation = feature_activations.mean()  # Calculate mean activation
+            non_zero_activations = feature_activations[feature_activations != 0]  # Shape: [sequence_length]
+            if len(non_zero_activations) > 0:
+                mean_activation = non_zero_activations.mean()
+            else:
+                mean_activation = 0.0
 
             # Find tokens with high activation values (top 5 per batch)
             top_k = 5  # Top 5 tokens per batch
@@ -228,7 +237,7 @@ print("Finished processing data.")
 
 # Prepare arguments for asynchronous execution
 feature_args = []
-for feature_idx, activations in enumerate(all_high_activations):
+for feature_idx, activations in enumerate(all_high_activations[:100]):
     for feature in activations:
         feature_idx, context_tokens, context_activations, activation_value = feature
     mean_activation = sum(context_activations) / len(context_activations) if len([a for a in context_activations if a > 0]) > 0 else 0.0
@@ -238,7 +247,7 @@ for feature_idx, activations in enumerate(all_high_activations):
 # Get descriptions for each feature
 results = []
 print("Starting to get feature descriptions...")
-max_workers = 10  # Number of parallel requests
+max_workers = 3  # Number of parallel requests
 with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
     futures = {executor.submit(get_feature_description_wrapper, args): args[0] for args in feature_args}
     for future in tqdm(concurrent.futures.as_completed(futures), total=len(futures), desc="Processing features", unit="feature"):
@@ -251,8 +260,23 @@ with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
         
 print("Finished getting feature descriptions.")
 
-# Save results to JSON
-with open(output_file, 'w') as f:
+def convert_ndarray_to_list(obj):
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+    elif isinstance(obj, torch.Tensor):
+        return obj.detach().cpu().numpy().tolist()
+    elif isinstance(obj, bytes):
+        return obj.decode('utf-8')
+    elif isinstance(obj, list):
+        return [convert_ndarray_to_list(item) for item in obj]
+    elif isinstance(obj, dict):
+        return {key: convert_ndarray_to_list(value) for key, value in obj.items()}
+    else:
+        return obj
+results = convert_ndarray_to_list(results)
+
+# Now you can safely dump 'results' to JSON
+with open(os.path.join(cache_dir, 'explanations.json'), 'w', encoding='utf-8') as f:
     json.dump(results, f, indent=2, ensure_ascii=False)
 
 print(f"Results saved to '{output_file}'.")

@@ -79,7 +79,7 @@ const MainPage = () => {
       <style jsx>{`
         @keyframes scroll {
           0% { transform: translateY(0%); }
-          100% { transform: translateY(-50%); }
+          100% { transform: translateY(50%); }
         }
         .animate-scroll {
           animation: scroll 30s linear infinite;
