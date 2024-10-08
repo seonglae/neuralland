@@ -6,8 +6,8 @@ import zstandard as zstd
 import io
 import pickle  # For caching
 from transformers import AutoTokenizer
-from mistral_sae.generate import get_input_activations_at_layer
-from mistral_sae.model import SteerableTransformer
+from transformer_lens import HookedTransformer, ActivationCache
+from sae_lens import SAE
 from mistralai import Mistral
 from tqdm import tqdm  # For progress bars
 
@@ -15,12 +15,12 @@ from tqdm import tqdm  # For progress bars
 batch_size = 1  # Adjust as needed
 data_path = 'pile-uncopyrighted/test/val.jsonl.zst'  # Replace with the actual data path
 mistral_models_path = 'Mistral-7B-Instruct-v0.3'  # Replace with the actual model path
-target_layer = 16  # Layer to get activations from
+target_layer = "blocks.16.hook_resid_pre"  # Layer to get activations from
 d_model = 4096  # Model's hidden size
 api_key = os.environ["MISTRAL_API_KEY"]
 model_name = "mistral-large-latest"
-output_file = 'feature_descriptions.json'
 cache_dir = 'act-cache'  # Directory to store cached activations and tokens
+output_file = os.path.join(cache_dir, 'explanations.json')
 
 # Ensure the cache directory exists
 os.makedirs(cache_dir, exist_ok=True)
@@ -30,7 +30,13 @@ client = Mistral(api_key=api_key)
 
 # Load tokenizer and model
 tokenizer = AutoTokenizer.from_pretrained('Mistral-7B-Instruct-v0.3')
-model = SteerableTransformer.from_folder(mistral_models_path).cuda()
+model = HookedTransformer.from_pretrained("mistral-7b-instruct", dtype="float16", device="cuda")
+sae, cfg_dict, sparsity = SAE.from_pretrained(
+    release="tylercosgrove/mistral-7b-sparse-autoencoder-layer16",
+    sae_id=".",
+    device="cuda"
+)
+
 model.eval()
 
 # Class to read data from compressed .jsonl.zst files
@@ -74,22 +80,24 @@ class CompressedJSONLLoader:
             self.file.close()
 
 # Function to create the interpretability prompt and send the request
-def get_feature_description(feature_idx, contexts):
+def get_feature_description(feature_idx, contexts, mean_activation):
     # contexts is a list of tuples: (tokens, activations)
     activations_str = ''
     prompt_str = ''
     for tokens, activations in contexts:
+        tokens = [token.replace('▁', ' ') for token in tokens]
+        activations = [int((activation + 1) * 5) for activation in activations]
         prompt_str += ''.join([f"{token}" for token in tokens])
         tokens_str = '\n'.join([f"{token}\t{activation_value:.4f}" for token, activation_value in zip(tokens, activations)])
         activations_str += f"<start>\n{tokens_str}\n<end>\n"
 
-    # Adjusted prompt to request a short JSON object
+    # Adjusted prompt to request a short description
     prompt = f"""We're studying neurons in a neural network.
 Each neuron looks for some particular thing in a short document.
 Look at summary of what the neuron does, and try to predict how it will fire on each token.
 Please provide a brief description of what neuron {feature_idx} is detecting.
-The activation format is token<tab>activation, activations go from -1 to 1, "unknown" indicates an unknown activation.
-Return your answer as a short JSON object with keys "description" and "id".
+The activation format is token<tab>activation, activations go from 0 to 10, "unknown" indicates an unknown activation. Most activations will be 0.
+Return your answer as a short JSON object with keys "description", "title" (short noun description of neuron), "mean_activation" of neuron {feature_idx}, "useful" (0-1), single "emoji" represents features well, and "confidence" (0-1).
 
 Activations:
 {activations_str}
@@ -114,27 +122,32 @@ Prompts:
                 "type": "json_object",
             }
         )
-        description = chat_response.choices[0].message.content.strip()
-        print(f"Description: {description}")
+        response = json.loads(chat_response.choices[0].message.content.strip())
+        print(f"Description: {response['description']}")
     except Exception as e:
         print(f"Error for feature {feature_idx}: {e}")
-        description = f"Error: {e}"
-    return {'feature_idx': feature_idx, 'description': description, 'prompt': prompt}
+        response = {'description': 'Error', 'title': 'Error', 'mean_activation': mean_activation}
+    return {'index': feature_idx, 'emoji': response['emoji'], 'description': response['description'], 'title': response['title'], 'mean_activation': mean_activation, 'useful': response['useful'], 'confidence': response['confidence'], 'contexts': contexts }
 
 
 # Function wrapper for asynchronous execution
 def get_feature_description_wrapper(args):
-    feature_idx, contexts = args
-    return get_feature_description(feature_idx, contexts)
+    feature_idx, contexts, mean_activation, useful, confidence = args
+    return get_feature_description(feature_idx, contexts, mean_activation)
 
 
 # Main processing loop
 data_loader = CompressedJSONLLoader(data_path, batch_size=batch_size)
 feature_contexts = {}  # Dictionary to store contexts per feature
+all_high_activations = []  # List to keep track of top activations across batches
 
 print("Starting to process data...")
 max_contexts_per_feature = 50  # Limit the number of contexts per feature
 window_size = 10  # Number of tokens before and after the high activation token
+
+# Get feature indices from the SAE model
+num_features = cfg_dict['d_sae']  # Get the number of features from the SAE configuration
+feature_indices = range(cfg_dict['d_sae'])  # Use range of d_sae as feature indices
 
 for batch_idx, batch in enumerate(tqdm(data_loader, desc="Processing batches", unit="batch")):
     cache_file = os.path.join(cache_dir, f'{os.path.basename(data_path)}_{batch_idx}.pkl')
@@ -154,13 +167,12 @@ for batch_idx, batch in enumerate(tqdm(data_loader, desc="Processing batches", u
 
             # Get activations from the model
             with torch.no_grad():
-                activations = get_input_activations_at_layer(
-                    input_ids.tolist(),
-                    model,
-                    target_layer=target_layer
-                ).cpu()  # Shape: [sequence_length, d_model]
+                _, cache = model.run_with_cache(input_ids)
+                activations = cache[target_layer]  # Extract activations at the target layer
+                activations = activations.squeeze(0).cpu()  # Shape: [sequence_length, d_model]
 
             # Convert activations and tokens to lists for saving
+            activations = sae.encode_standard(activations)  # Use SAE to encode activations into sparse features
             activations = activations.to(torch.float32).numpy()
             input_ids = input_ids.cpu().numpy()[0]  # Shape: [sequence_length]
             tokens = tokenizer.convert_ids_to_tokens(input_ids)
@@ -174,21 +186,19 @@ for batch_idx, batch in enumerate(tqdm(data_loader, desc="Processing batches", u
         print(f"Saved batch {batch_idx} to cache.")
 
     # Now process the tokens and activations
+    batch_high_activations = []
     for tokens, activations in zip(tokens_list, activations_list):
-        num_features = activations.shape[1]
-        for feature_idx in range(num_features):
+        for feature_idx in feature_indices:
             # Initialize contexts list for the feature if not already done
             if feature_idx not in feature_contexts:
                 feature_contexts[feature_idx] = []
 
-            # Skip if we already have enough contexts for this feature
-            if len(feature_contexts[feature_idx]) >= max_contexts_per_feature:
-                continue
-
             # Get activation values for each feature
             feature_activations = activations[:, feature_idx]  # Shape: [sequence_length]
-            # Find tokens with high activation values
-            top_k = 5  # Top 5 tokens
+            mean_activation = feature_activations.mean()  # Calculate mean activation
+
+            # Find tokens with high activation values (top 5 per batch)
+            top_k = 5  # Top 5 tokens per batch
             high_activation_indices = feature_activations.argsort()[::-1][:top_k]
 
             for idx in high_activation_indices:
@@ -200,7 +210,14 @@ for batch_idx, batch in enumerate(tqdm(data_loader, desc="Processing batches", u
 
                 # Store context for the feature
                 if len(feature_contexts[feature_idx]) < max_contexts_per_feature:
-                    feature_contexts[feature_idx].append((context_tokens, context_activations))
+                    feature_contexts[feature_idx].append((context_tokens, context_activations, mean_activation))
+
+                # Add to batch high activations list
+                batch_high_activations.append((feature_idx, context_tokens, context_activations, feature_activations[idx]))
+
+    for feature_idx, context_tokens, context_activations, activation_value in batch_high_activations:
+        all_high_activations[feature_idx].append((feature_idx, context_tokens, context_activations, activation_value))
+        all_high_activations[feature_idx] = sorted(all_high_activations[feature_idx], key=lambda x: x[3], reverse=True)[:10]
 
     # Optional: Limit the number of batches to process for testing
     # if batch_idx + 1 >= 5:
@@ -210,7 +227,13 @@ for batch_idx, batch in enumerate(tqdm(data_loader, desc="Processing batches", u
 print("Finished processing data.")
 
 # Prepare arguments for asynchronous execution
-feature_args = list(feature_contexts.items())[:100]
+feature_args = []
+for feature_idx, activations in enumerate(all_high_activations):
+    for feature in activations:
+        feature_idx, context_tokens, context_activations, activation_value = feature
+    mean_activation = sum(context_activations) / len(context_activations) if len([a for a in context_activations if a > 0]) > 0 else 0.0
+    
+    feature_args.append((feature_idx, [(context_tokens, context_activations)], mean_activation))
 
 # Get descriptions for each feature
 results = []
