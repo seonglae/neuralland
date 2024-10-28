@@ -15,7 +15,7 @@ xformers = { url = "https://download.pytorch.org/whl/cu124/xformers-0.0.28.post1
 mistral-common = "^1.4.4"
 mistralai = "^1.1.0"
 transformer-lens = "^2.7.0"
-mistral-sae = "^0.1.0"
+mistral-sae = "^0.1.3"
 zstandard = "^0.23.0"
 fastapi = {extras = ["all"], version = "^0.115.0"}
 uvicorn = "^0.31.0"
